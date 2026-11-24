@@ -24,7 +24,13 @@ import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.WindowManager
 import android.widget.TextView
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
+import com.google.mlkit.common.model.DownloadConditions
+import com.google.mlkit.nl.translate.TranslateLanguage
+import com.google.mlkit.nl.translate.Translation
+import com.google.mlkit.nl.translate.Translator
+import com.google.mlkit.nl.translate.TranslatorOptions
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
@@ -54,6 +60,13 @@ class CaptureService : Service() {
     private var screenWidth = 0
     private var screenHeight = 0
     private var density = 1
+
+    // Translation state (used on the main thread only)
+    private val translators = HashMap<String, Translator>()
+    private val readySources = HashSet<String>()
+    private var generation = 0
+    private var noticeShown = false
+    private var lastToast = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -153,40 +166,102 @@ class CaptureService : Service() {
             }
     }
 
+    // Pick the source language of one OCR line from its script.
+    private fun detectSource(text: String): String {
+        for (ch in text) {
+            val c = ch.code
+            if (c in 0xAC00..0xD7AF || c in 0x1100..0x11FF || c in 0x3130..0x318F) {
+                return TranslateLanguage.KOREAN
+            }
+        }
+        for (ch in text) {
+            val c = ch.code
+            if (c in 0x4E00..0x9FFF) return TranslateLanguage.CHINESE
+        }
+        return TranslateLanguage.ENGLISH
+    }
+
+    private fun translatorFor(source: String): Translator {
+        return translators.getOrPut(source) {
+            Translation.getClient(
+                TranslatorOptions.Builder()
+                    .setSourceLanguage(source)
+                    .setTargetLanguage(TranslateLanguage.THAI)
+                    .build()
+            )
+        }
+    }
+
+    private fun toast(message: String) {
+        val now = System.currentTimeMillis()
+        if (now - lastToast < 8000) return
+        lastToast = now
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+    }
+
     private fun showOverlay(result: Text) {
         clearOverlays()
-        val scaleX = screenWidth.toFloat() / screenWidth
-        val scaleY = screenHeight.toFloat() / screenHeight
+        generation++
+        val current = generation
+        if (!noticeShown && result.textBlocks.isNotEmpty()) {
+            noticeShown = true
+            toast("กำลังเตรียมโมเดลแปลไทย (ครั้งแรกต้องต่อเน็ต)")
+        }
         for (block in result.textBlocks) {
             for (line in block.lines) {
                 val box = line.boundingBox ?: continue
-                val label = TextView(this).apply {
-                    text = "… ${line.text}"
-                    textSize = 13f
-                    setTextColor(0xFF171717.toInt())
-                    setBackgroundColor(0xEFFFFFFF.toInt())
-                    setPadding(5, 2, 5, 2)
-                    elevation = 8f
+                val original = line.text.trim()
+                if (original.isEmpty()) continue
+                val source = detectSource(original)
+                val translator = translatorFor(source)
+                if (source in readySources) {
+                    translateLine(translator, original, box, current)
+                } else {
+                    translator.downloadModelIfNeeded(DownloadConditions.Builder().build())
+                        .addOnSuccessListener {
+                            readySources.add(source)
+                            translateLine(translator, original, box, current)
+                        }
+                        .addOnFailureListener {
+                            toast("โหลดโมเดลแปลไม่สำเร็จ ลองต่อเน็ตแล้วเริ่มใหม่")
+                        }
                 }
-                val params = WindowManager.LayoutParams(
-                    (box.width() * scaleX).toInt().coerceAtLeast(60),
-                    WindowManager.LayoutParams.WRAP_CONTENT,
-                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                    PixelFormat.TRANSLUCENT
-                ).apply {
-                    gravity = Gravity.TOP or Gravity.START
-                    x = box.left
-                    y = box.top
-                }
-                try {
-                    windowManager?.addView(label, params)
-                    overlays.add(label)
-                } catch (_: Exception) { }
             }
         }
+    }
+
+    private fun translateLine(translator: Translator, original: String, box: Rect, gen: Int) {
+        translator.translate(original).addOnSuccessListener { thai ->
+            if (gen == generation) addLabel(box, thai)
+        }
+    }
+
+    private fun addLabel(box: Rect, translated: String) {
+        val label = TextView(this).apply {
+            text = translated
+            textSize = 13f
+            setTextColor(0xFF171717.toInt())
+            setBackgroundColor(0xEFFFFFFF.toInt())
+            setPadding(5, 2, 5, 2)
+            elevation = 8f
+        }
+        val params = WindowManager.LayoutParams(
+            box.width().coerceAtLeast(60),
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = box.left
+            y = box.top
+        }
+        try {
+            windowManager?.addView(label, params)
+            overlays.add(label)
+        } catch (_: Exception) { }
     }
 
     private fun clearOverlays() {
@@ -211,7 +286,10 @@ class CaptureService : Service() {
             .build()
 
     override fun onDestroy() {
+        generation++
         clearOverlays()
+        translators.values.forEach { it.close() }
+        translators.clear()
         virtualDisplay?.release()
         reader?.close()
         projection?.stop()
